@@ -1,0 +1,30 @@
+# Build results
+[Bb]in/
+[Oo]bj/
+*.pdb
+*.suo
+*.user
+*.log
+*.vspscc
+*.vssscc
+*.builds
+*.bak
+
+# Rider
+.idea/
+*.iml
+
+# Visual Studio Code
+.vscode/
+
+# NuGet packages
+packages/
+*.nupkg
+
+# Temporary files
+Temp/
+tmp/
+
+# User-specific settings
+*.userprefs
+*.csproj.user
