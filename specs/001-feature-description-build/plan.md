@@ -34,12 +34,12 @@
 ## Summary
 Implement a low-latency .NET 9 console (or Windows tray) application that subscribes to Argentine market instruments via Primary.Net and continuously updates an open Excel workbook sheet `MarketData` with quote fields for ~200 symbols, meeting p95<1s (target 500ms per constitution) write latency and auto-managing staleness, duplicate symbols, missing columns, and dynamic symbol additions.
 
-Core approach: Event-driven subscription adapter → in-memory symbol index → update coalescer & batcher → Excel interop writer (batched flush) + stale monitor + structured logging & metrics emitter.
+Core approach: Event-driven subscription adapter → in-memory symbol index → update coalescer & batcher → Excel late-bound COM writer (batched flush) + stale monitor + structured logging & metrics emitter.
 
 ## Technical Context
 
 **Language/Version**: .NET 9 (C# 13)  
-**Primary Dependencies**: Primary.Net (market data), ClosedXML (Excel writing) OR Microsoft.Office.Interop.Excel (decision in research), System.Text.Json for structured logs  
+**Primary Dependencies**: Primary.Net (market data), Late-Bound COM Excel interop (dynamic dispatch), System.Text.Json for structured logs  
 **Storage**: In-memory only (no persistence)  
 **Testing**: xUnit + FluentAssertions + Moq + potential BenchmarkDotNet micro bench (latency hot path)  
 **Target Platform**: Windows desktop (Excel installed)  
@@ -60,7 +60,7 @@ Principle Mapping:
 - II (Low-Latency Simplicity): Single in-proc pipeline, batching thresholds defined, no premature microservices.
 - III (Test-First Reliability): TDD sequence: model + adapter contracts → stale logic tests → batch flush tests → integration replay harness.
 - IV (Observability): Metrics & log events enumerated (see Design). Heartbeat row planned.
-- V (Minimal Dependencies): Only Primary.Net + Excel library; evaluate ClosedXML vs Interop; adopt one; justify if adding more (e.g., metrics lib).
+- V (Minimal Dependencies): Only Primary.Net + Late-Bound COM Excel interop; no external Excel library packages required; justify if adding more (e.g., metrics lib).
 
 No violations at this stage. Proceed.
 
@@ -136,7 +136,7 @@ For each technology choice:
 
 Planned Research Topics:
 
-1. Excel write strategy: ClosedXML vs Interop latency & thread safety.
+1. Excel write strategy: Late-Bound COM interop implementation & thread safety.
 2. Primary.Net subscription API surface: async pattern, reconnect semantics.
 3. Batching algorithm parameters: dynamic vs fixed threshold (latency impact).
 4. Metrics emission: latency histogram, dropped tick classification, reconnect counts vs lightweight library.

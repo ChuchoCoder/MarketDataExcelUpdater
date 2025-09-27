@@ -7,11 +7,9 @@ Feature: Near Real-Time Argentine Market → Excel Updater
 
 ### Excel Write Strategy
 
-- Decision: Use ClosedXML for initial implementation.
-- Rationale: Simpler object model, avoids COM interop threading issues, supports batch cell updates in-memory before Save()/Write to stream; acceptable latency for ~200 symbol updates.
-- Alternatives:
-  - Microsoft.Office.Interop.Excel: Pros: Direct live workbook interaction; Cons: COM complexity, STA threading, higher risk of hangs.
-  - EPPlus: Strong API but additional licensing considerations for some use; considered but ClosedXML sufficient.
+- Decision: Use Late-Bound COM Excel interop via dynamic dispatch.
+- Rationale: Version-agnostic approach that works with any installed Excel version, provides direct live workbook interaction without assembly version conflicts, supports real-time cell updates for open workbooks.
+- Alternatives Considered: Other Excel libraries were evaluated but rejected due to file locking issues or lack of real-time update support for open workbooks.
 
 ### Market Data Subscription via Primary.Net
 
@@ -57,9 +55,9 @@ Feature: Near Real-Time Argentine Market → Excel Updater
 
 | Risk | Impact | Mitigation |
 |------|--------|------------|
-| ClosedXML latency spikes under heavy churn | Medium | Measure p95/p99; fallback to Interop if needed |
+| COM interop stability under sustained load | Medium | Implement robust error handling and COM object lifecycle management |
 | Primary.Net reconnect semantics unknown | Medium | Add retry/backoff; log exhaustive reconnect metrics |
-| Excel file lock/contention | Low | Keep writes batched; open workbook read/write once |
+| Excel application process crash/restart | Medium | Detect Excel availability and reconnect automatically |
 | Time drift causing misleading timestamps | Low | Add discrepancy log when >2s offset |
 
 ## Summary

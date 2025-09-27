@@ -39,12 +39,12 @@ Legend:
 1. Task B9: Implement retention (100 ticks / 5 min) & eviction trimming tests (FR-016, FR-026)
 1. Task B10: Implement numeric formatting utility & tests (FR-029)
 
-## Phase C: Excel Integration (ClosedXML)
+## Phase C: Excel Integration (Late-Bound COM)
 
-1. Task C1: Integrate ClosedXML package; implement real `ClosedXmlExcelWriter` adapting contract (FR-003, FR-017)
-1. Task C2: Add column auto-create logic (append canonical order) (FR-017)
-1. Task C3: Implement batched flush applying cell updates (optimize to single SaveChanges style) (FR-010)
-1. Task C4: Add numeric formatting preservation tests (FR-021)
+1. Task C1: Implement `ExcelLateBoundWriter` using late-bound COM interop adapting contract (FR-003, FR-017)
+1. Task C2: Add column auto-create logic (append canonical order) using COM dynamic dispatch (FR-017)
+1. Task C3: Implement batched flush applying cell updates via COM Range operations (FR-010)
+1. Task C4: Add numeric formatting preservation tests using COM cell formatting (FR-021)
 1. Task C5: Gate C - Latency micro-benchmark for flush path (<50ms p95 synthetic) (FR-003)
 1. Task C6: Implement latency histogram & flush latency metrics (FR-019, FR-030)
 1. Task C7: Implement clock drift detection + throttled warning (FR-027)
