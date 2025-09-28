@@ -25,15 +25,32 @@ namespace MarketDataExcelUpdater.Infrastructure.Excel
         private string? _currentFilePath;
         private bool _disposed;
 
+        // Buffering configuration and state
+        private readonly TimeSpan _bufferFlushInterval;
+        private readonly int _maxBufferSize;
+        private readonly Dictionary<string, CellUpdate> _updateBuffer = new(); // Key: SheetName_ColumnName_RowIndex, Value: Latest update
+        private readonly object _bufferLock = new object();
+        private System.Threading.Timer? _flushTimer;
+
         // Exponential backoff state
         private DateTime? _lastFailureTime;
         private int _consecutiveFailures;
         private readonly TimeSpan _maxBackoffDelay = TimeSpan.FromSeconds(30);
         private readonly TimeSpan _baseDelay = TimeSpan.FromMilliseconds(500);
 
-        public ExcelLateBoundWriter(ILogger<ExcelLateBoundWriter> logger)
+        public ExcelLateBoundWriter(ILogger<ExcelLateBoundWriter> logger, 
+            TimeSpan? bufferFlushInterval = null, 
+            int maxBufferSize = 1000)
         {
             _logger = logger ?? throw new ArgumentNullException(nameof(logger));
+            _bufferFlushInterval = bufferFlushInterval ?? TimeSpan.FromMilliseconds(500);
+            _maxBufferSize = maxBufferSize;
+            
+            // Initialize the flush timer
+            _flushTimer = new System.Threading.Timer(FlushBufferCallback, null, _bufferFlushInterval, _bufferFlushInterval);
+            
+            _logger.LogInformation("ExcelLateBoundWriter initialized with buffer flush interval: {FlushInterval}ms, max buffer size: {MaxBufferSize}", 
+                _bufferFlushInterval.TotalMilliseconds, _maxBufferSize);
         }
 
         public async ValueTask WriteAsync(UpdateBatch batch, CancellationToken ct = default)
@@ -50,29 +67,53 @@ namespace MarketDataExcelUpdater.Infrastructure.Excel
                 return; // Skip this write attempt, let market data continue flowing
             }
 
-            _logger.LogInformation("=== EXCEL LATE-BOUND WRITE BATCH START ===");
-            _logger.LogInformation("Writing batch with {Count} updates", batch.Updates.Count);
+            _logger.LogDebug("Adding batch with {Count} updates to buffer", batch.Updates.Count);
 
-            try
+            int duplicatesReplaced = 0;
+            
+            // Add updates to buffer with deduplication instead of writing immediately
+            lock (_bufferLock)
             {
                 foreach (var update in batch.Updates)
                 {
-                    await WriteUpdateAsync(update, ct);
+                    string cellKey = GetCellKey(update);
+                    
+                    // Track if we're replacing a duplicate
+                    if (_updateBuffer.ContainsKey(cellKey))
+                    {
+                        duplicatesReplaced++;
+                    }
+                    
+                    // Last update wins - this automatically deduplicates
+                    _updateBuffer[cellKey] = update;
                 }
+                
+                // Log deduplication statistics
+                if (duplicatesReplaced > 0)
+                {
+                    _logger.LogDebug("Deduplicated {DuplicateCount} updates from batch of {BatchSize}. Buffer now has {BufferSize} unique cells", 
+                        duplicatesReplaced, batch.Updates.Count, _updateBuffer.Count);
+                }
+                
+                // If buffer exceeds max size, trigger immediate flush
+                if (_updateBuffer.Count >= _maxBufferSize)
+                {
+                    _logger.LogInformation("Buffer size ({BufferSize}) exceeded max size ({MaxSize}), triggering immediate flush", 
+                        _updateBuffer.Count, _maxBufferSize);
+                    
+                    // Process immediately without waiting for timer
+                    _ = Task.Run(async () => await FlushBufferAsync(ct));
+                }
+            }
 
-                // Reset failure tracking on successful write
-                ResetBackoffState();
-                _logger.LogInformation("=== EXCEL LATE-BOUND WRITE BATCH COMPLETE ===");
-            }
-            catch (Exception ex)
-            {
-                HandleWriteFailure(ex);
-                // Don't rethrow - allow market data to continue flowing
-            }
+            await Task.CompletedTask;
         }
 
         public async ValueTask FlushAsync(CancellationToken ct = default)
         {
+            // First, flush any buffered updates
+            await FlushBufferAsync(ct);
+
             // Skip flush if we're in backoff period to avoid additional COM errors
             if (IsInBackoffPeriod())
             {
@@ -97,8 +138,6 @@ namespace MarketDataExcelUpdater.Infrastructure.Excel
                 HandleWriteFailure(ex);
                 // Don't rethrow during normal operations - allow graceful degradation
             }
-
-            await Task.CompletedTask;
         }
 
         /// <summary>
@@ -184,8 +223,8 @@ namespace MarketDataExcelUpdater.Infrastructure.Excel
                 // Use late binding to update the cell
                 worksheet.Cells[update.RowIndex, colIndex] = update.Value;
                 
-                _logger.LogDebug("Updated cell [{Row}, {Col}] in sheet '{Sheet}' with value: {Value}", 
-                    update.RowIndex, colIndex, update.SheetName, update.Value);
+                // _logger.LogDebug("Updated cell [{Row}, {Col}] in sheet '{Sheet}' with value: {Value}", 
+                //     update.RowIndex, colIndex, update.SheetName, update.Value);
             }
             catch (COMException ex)
             {
@@ -245,8 +284,8 @@ namespace MarketDataExcelUpdater.Infrastructure.Excel
                 // Check if we already have this column mapped
                 if (_columnMapping.TryGetValue(mappingKey, out int existingColumn))
                 {
-                    _logger.LogDebug("Found cached column '{ColumnName}' at index {ColumnIndex} in sheet '{SheetName}'", 
-                        columnName, existingColumn, worksheetName);
+                    // _logger.LogDebug("Found cached column '{ColumnName}' at index {ColumnIndex} in sheet '{SheetName}'", 
+                    //     columnName, existingColumn, worksheetName);
                     return existingColumn;
                 }
 
@@ -357,6 +396,75 @@ namespace MarketDataExcelUpdater.Infrastructure.Excel
             return result;
         }
 
+        #region Buffer Management
+
+        /// <summary>
+        /// Generate a unique key for a cell update to enable deduplication
+        /// </summary>
+        private static string GetCellKey(CellUpdate update)
+        {
+            return $"{update.SheetName}_{update.ColumnName}_{update.RowIndex}";
+        }
+
+        /// <summary>
+        /// Timer callback method for periodic buffer flushing
+        /// </summary>
+        private void FlushBufferCallback(object? state)
+        {
+            // Use async void for fire-and-forget timer callback
+            _ = Task.Run(async () => await FlushBufferAsync(CancellationToken.None));
+        }
+
+        /// <summary>
+        /// Flush the buffered updates to Excel
+        /// </summary>
+        private async Task FlushBufferAsync(CancellationToken ct = default)
+        {
+            List<CellUpdate> updatesToProcess;
+            
+            // Extract updates from buffer under lock
+            lock (_bufferLock)
+            {
+                if (_updateBuffer.Count == 0)
+                    return; // Nothing to flush
+                
+                // Convert dictionary values to list for processing
+                updatesToProcess = new List<CellUpdate>(_updateBuffer.Values);
+                _updateBuffer.Clear();
+            }
+
+            // Check if we're in a backoff period before processing
+            if (IsInBackoffPeriod())
+            {
+                var remainingBackoff = GetRemainingBackoffTime();
+                _logger.LogDebug("Skipping buffered Excel write - in backoff period for {RemainingSeconds:F1} more seconds. " +
+                    "Discarding {UpdateCount} updates", remainingBackoff.TotalSeconds, updatesToProcess.Count);
+                return;
+            }
+
+            _logger.LogInformation("=== EXCEL LATE-BOUND BUFFER FLUSH START ===");
+            _logger.LogInformation("Flushing {Count} deduplicated updates to Excel", updatesToProcess.Count);
+
+            try
+            {
+                foreach (var update in updatesToProcess)
+                {
+                    await WriteUpdateAsync(update, ct);
+                }
+
+                // Reset failure tracking on successful write
+                ResetBackoffState();
+                _logger.LogInformation("=== EXCEL LATE-BOUND BUFFER FLUSH COMPLETE ===");
+            }
+            catch (Exception ex)
+            {
+                HandleWriteFailure(ex);
+                // Don't rethrow - allow timer to continue operating
+            }
+        }
+
+        #endregion
+
         #region Exponential Backoff Logic
 
         /// <summary>
@@ -463,6 +571,16 @@ namespace MarketDataExcelUpdater.Infrastructure.Excel
 
             try
             {
+                // Stop the timer first to prevent new flushes
+                if (_flushTimer != null)
+                {
+                    _flushTimer.Dispose();
+                    _flushTimer = null;
+                }
+
+                // Flush any remaining buffered updates before closing
+                await FlushBufferAsync();
+
                 if (_workbook != null)
                 {
                     _logger.LogInformation("Closing Excel workbook");
@@ -485,7 +603,6 @@ namespace MarketDataExcelUpdater.Infrastructure.Excel
             }
 
             _disposed = true;
-            await Task.CompletedTask;
         }
 
         // Implement IDisposable for legacy compatibility
