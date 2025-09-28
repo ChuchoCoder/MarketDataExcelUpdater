@@ -8,12 +8,12 @@ namespace MarketDataExcelUpdater.Core.Configuration;
 /// </summary>
 public static class ConfigurationBootstrap
 {
-    public static AppConfiguration LoadWithLogging(ILogger? logger = null, string? jsonPath = null)
+    public static AppConfiguration LoadWithLogging(ILogger? logger = null, string? jsonPath = null, string[]? args = null)
     {
         AppConfiguration config;
         try
         {
-            config = ConfigurationLoader.Load(jsonPath: jsonPath, optional: true, diagnostics: msg => logger?.LogInformation("[config] {Message}", msg));
+            config = ConfigurationLoader.Load(jsonPath: jsonPath, optional: true, diagnostics: msg => logger?.LogInformation("[config] {Message}", msg), args: args);
         }
         catch (ConfigurationException ex)
         {

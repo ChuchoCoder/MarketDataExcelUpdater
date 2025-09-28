@@ -20,8 +20,16 @@ namespace MarketDataExcelUpdater.Infrastructure.Excel
         private dynamic? _excelApp;
         private dynamic? _workbook;
         private readonly Dictionary<string, dynamic> _worksheets = new();
+        private readonly Dictionary<string, int> _columnMapping = new(); // worksheet_columnName -> columnIndex
+        private readonly Dictionary<string, int> _nextColumnIndex = new(); // worksheetName -> next available column
         private string? _currentFilePath;
         private bool _disposed;
+
+        // Exponential backoff state
+        private DateTime? _lastFailureTime;
+        private int _consecutiveFailures;
+        private readonly TimeSpan _maxBackoffDelay = TimeSpan.FromSeconds(30);
+        private readonly TimeSpan _baseDelay = TimeSpan.FromMilliseconds(500);
 
         public ExcelLateBoundWriter(ILogger<ExcelLateBoundWriter> logger)
         {
@@ -33,6 +41,15 @@ namespace MarketDataExcelUpdater.Infrastructure.Excel
             if (_workbook == null)
                 throw new InvalidOperationException("Excel workbook not initialized. Ensure a file path is set.");
 
+            // Check if we're in a backoff period
+            if (IsInBackoffPeriod())
+            {
+                var remainingBackoff = GetRemainingBackoffTime();
+                _logger.LogDebug("Skipping Excel write - in backoff period for {RemainingSeconds:F1} more seconds", 
+                    remainingBackoff.TotalSeconds);
+                return; // Skip this write attempt, let market data continue flowing
+            }
+
             _logger.LogInformation("=== EXCEL LATE-BOUND WRITE BATCH START ===");
             _logger.LogInformation("Writing batch with {Count} updates", batch.Updates.Count);
 
@@ -43,17 +60,28 @@ namespace MarketDataExcelUpdater.Infrastructure.Excel
                     await WriteUpdateAsync(update, ct);
                 }
 
+                // Reset failure tracking on successful write
+                ResetBackoffState();
                 _logger.LogInformation("=== EXCEL LATE-BOUND WRITE BATCH COMPLETE ===");
             }
             catch (Exception ex)
             {
-                _logger.LogError(ex, "Failed to write batch to Excel");
-                throw;
+                HandleWriteFailure(ex);
+                // Don't rethrow - allow market data to continue flowing
             }
         }
 
         public async ValueTask FlushAsync(CancellationToken ct = default)
         {
+            // Skip flush if we're in backoff period to avoid additional COM errors
+            if (IsInBackoffPeriod())
+            {
+                var remainingBackoff = GetRemainingBackoffTime();
+                _logger.LogDebug("Skipping Excel flush - in backoff period for {RemainingSeconds:F1} more seconds", 
+                    remainingBackoff.TotalSeconds);
+                return;
+            }
+
             try
             {
                 if (_workbook != null)
@@ -65,8 +93,9 @@ namespace MarketDataExcelUpdater.Infrastructure.Excel
             }
             catch (Exception ex)
             {
-                _logger.LogError(ex, "Failed to flush Excel workbook");
-                throw;
+                _logger.LogWarning(ex, "Failed to flush Excel workbook during backoff period");
+                HandleWriteFailure(ex);
+                // Don't rethrow during normal operations - allow graceful degradation
             }
 
             await Task.CompletedTask;
@@ -80,7 +109,18 @@ namespace MarketDataExcelUpdater.Infrastructure.Excel
             try
             {
                 _logger.LogInformation("Initializing Excel with late binding for live updates to {FilePath}", filePath);
-                _currentFilePath = Path.GetFullPath(filePath);
+                
+                // Resolve path relative to application base directory (where the exe runs from)
+                // This ensures relative paths work correctly regardless of current working directory
+                if (Path.IsPathRooted(filePath))
+                {
+                    _currentFilePath = Path.GetFullPath(filePath);
+                }
+                else
+                {
+                    var basePath = AppContext.BaseDirectory;
+                    _currentFilePath = Path.GetFullPath(Path.Combine(basePath, filePath));
+                }
 
                 // Create Excel application using late binding (COM)
                 Type? excelType = Type.GetTypeFromProgID("Excel.Application");
@@ -199,48 +239,87 @@ namespace MarketDataExcelUpdater.Infrastructure.Excel
         {
             try
             {
-                // Check if we have cached column mappings for this worksheet
-                string worksheetKey = $"{worksheet.Name}_{columnName}";
+                string worksheetName = (string)worksheet.Name;
+                string mappingKey = $"{worksheetName}_{columnName}";
                 
-                // Check if header row exists and find the column
-                dynamic headerRow = worksheet.Rows[1];
-                
-                // Get the used range to find the last column with data
-                dynamic usedRange = worksheet.UsedRange;
-                int lastColumn = usedRange?.Columns?.Count ?? 0;
-                
-                // Search for existing column with this header
-                for (int col = 1; col <= lastColumn; col++)
+                // Check if we already have this column mapped
+                if (_columnMapping.TryGetValue(mappingKey, out int existingColumn))
                 {
+                    _logger.LogDebug("Found cached column '{ColumnName}' at index {ColumnIndex} in sheet '{SheetName}'", 
+                        columnName, existingColumn, worksheetName);
+                    return existingColumn;
+                }
+
+                // Initialize next column index for this worksheet if not set
+                if (!_nextColumnIndex.TryGetValue(worksheetName, out int nextColumn))
+                {
+                    // For new worksheets, scan existing columns first
+                    nextColumn = 1;
                     try
                     {
-                        dynamic cellValue = worksheet.Cells[1, col];
-                        string headerValue = cellValue?.Value?.ToString() ?? "";
-                        
-                        if (string.Equals(headerValue, columnName, StringComparison.OrdinalIgnoreCase))
+                        dynamic usedRange = worksheet.UsedRange;
+                        if (usedRange != null)
                         {
-                            _logger.LogDebug("Found existing column '{ColumnName}' at index {ColumnIndex} in sheet '{SheetName}'", 
-                                columnName, col, (string)worksheet.Name);
-                            return col;
+                            int lastColumn = usedRange.Columns.Count;
+                            
+                            // Scan existing headers to build initial mapping
+                            for (int col = 1; col <= lastColumn; col++)
+                            {
+                                try
+                                {
+                                    dynamic cellValue = worksheet.Cells[1, col];
+                                    string headerValue = cellValue?.Value?.ToString() ?? "";
+                                    
+                                    if (!string.IsNullOrEmpty(headerValue))
+                                    {
+                                        string existingMappingKey = $"{worksheetName}_{headerValue}";
+                                        _columnMapping[existingMappingKey] = col;
+                                        _logger.LogDebug("Found existing header '{HeaderValue}' at column {Column} in sheet '{SheetName}'", 
+                                            headerValue, col, worksheetName);
+                                    }
+                                }
+                                catch
+                                {
+                                    // Skip if unable to read cell
+                                }
+                            }
+                            nextColumn = lastColumn + 1;
                         }
                     }
                     catch
                     {
-                        // Skip if unable to read cell
-                        continue;
+                        // If we can't read the used range, start from column 1
+                        nextColumn = 1;
                     }
+                    
+                    _nextColumnIndex[worksheetName] = nextColumn;
+                }
+                else
+                {
+                    nextColumn = _nextColumnIndex[worksheetName];
                 }
 
-                // Create new column - find the next available column
-                int nextColumn = lastColumn + 1;
+                // Check if the column already exists after scanning
+                if (_columnMapping.TryGetValue(mappingKey, out int foundColumn))
+                {
+                    _logger.LogDebug("Found existing column '{ColumnName}' at index {ColumnIndex} in sheet '{SheetName}' during scan", 
+                        columnName, foundColumn, worksheetName);
+                    return foundColumn;
+                }
+
+                // Create new column
                 worksheet.Cells[1, nextColumn] = columnName;
                 
                 // Format the header
                 dynamic newHeaderCell = worksheet.Cells[1, nextColumn];
                 newHeaderCell.Font.Bold = true;
                 
+                // Cache the mapping and update next column index
+                _columnMapping[mappingKey] = nextColumn;
+                _nextColumnIndex[worksheetName] = nextColumn + 1;
+                
                 _logger.LogInformation("Created new column '{ColumnName}' at index {ColumnIndex} in sheet '{SheetName}'", 
-                    columnName, nextColumn, (string)worksheet.Name);
+                    columnName, nextColumn, worksheetName);
                 
                 await Task.CompletedTask;
                 return nextColumn;
@@ -277,6 +356,106 @@ namespace MarketDataExcelUpdater.Infrastructure.Excel
             }
             return result;
         }
+
+        #region Exponential Backoff Logic
+
+        /// <summary>
+        /// Check if we're currently in a backoff period due to previous failures
+        /// </summary>
+        private bool IsInBackoffPeriod()
+        {
+            if (_lastFailureTime == null || _consecutiveFailures == 0)
+                return false;
+
+            var timeSinceLastFailure = DateTime.UtcNow - _lastFailureTime.Value;
+            var requiredBackoffTime = CalculateBackoffDelay();
+            
+            return timeSinceLastFailure < requiredBackoffTime;
+        }
+
+        /// <summary>
+        /// Get the remaining time in the current backoff period
+        /// </summary>
+        private TimeSpan GetRemainingBackoffTime()
+        {
+            if (_lastFailureTime == null)
+                return TimeSpan.Zero;
+
+            var timeSinceLastFailure = DateTime.UtcNow - _lastFailureTime.Value;
+            var requiredBackoffTime = CalculateBackoffDelay();
+            var remaining = requiredBackoffTime - timeSinceLastFailure;
+            
+            return remaining > TimeSpan.Zero ? remaining : TimeSpan.Zero;
+        }
+
+        /// <summary>
+        /// Calculate the current backoff delay based on consecutive failures
+        /// </summary>
+        private TimeSpan CalculateBackoffDelay()
+        {
+            if (_consecutiveFailures <= 0)
+                return TimeSpan.Zero;
+
+            // Exponential backoff: base * 2^(failures-1), capped at maxBackoffDelay
+            var delay = TimeSpan.FromMilliseconds(
+                _baseDelay.TotalMilliseconds * Math.Pow(2, _consecutiveFailures - 1));
+            
+            return delay > _maxBackoffDelay ? _maxBackoffDelay : delay;
+        }
+
+        /// <summary>
+        /// Handle a write failure by updating backoff state and logging appropriately
+        /// </summary>
+        private void HandleWriteFailure(Exception ex)
+        {
+            _consecutiveFailures++;
+            _lastFailureTime = DateTime.UtcNow;
+            
+            var nextBackoffDelay = CalculateBackoffDelay();
+            
+            // Log at different levels based on failure count to reduce verbosity
+            if (_consecutiveFailures == 1)
+            {
+                _logger.LogWarning(ex, "Excel write failed. Market data continues flowing. Next attempt in {DelaySeconds:F1}s", 
+                    nextBackoffDelay.TotalSeconds);
+            }
+            else if (_consecutiveFailures <= 3)
+            {
+                _logger.LogInformation("Excel write failed (attempt {FailureCount}). Next attempt in {DelaySeconds:F1}s", 
+                    _consecutiveFailures, nextBackoffDelay.TotalSeconds);
+            }
+            else
+            {
+                // After 3 failures, only log every 5th failure to reduce noise
+                if (_consecutiveFailures % 5 == 0)
+                {
+                    _logger.LogWarning("Excel write continues to fail ({FailureCount} consecutive failures). " +
+                        "Next attempt in {DelaySeconds:F1}s. Check Excel application state.", 
+                        _consecutiveFailures, nextBackoffDelay.TotalSeconds);
+                }
+                else
+                {
+                    _logger.LogDebug("Excel write failed (attempt {FailureCount}). Next attempt in {DelaySeconds:F1}s", 
+                        _consecutiveFailures, nextBackoffDelay.TotalSeconds);
+                }
+            }
+        }
+
+        /// <summary>
+        /// Reset backoff state after successful write
+        /// </summary>
+        private void ResetBackoffState()
+        {
+            if (_consecutiveFailures > 0)
+            {
+                _logger.LogInformation("Excel write recovered after {FailureCount} consecutive failures", 
+                    _consecutiveFailures);
+                _consecutiveFailures = 0;
+                _lastFailureTime = null;
+            }
+        }
+
+        #endregion
 
         public async ValueTask DisposeAsync()
         {

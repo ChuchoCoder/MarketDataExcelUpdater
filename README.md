@@ -66,7 +66,7 @@ The application is configured to use the LateBound writer by default:
 Or via environment variable:
 
 ```bash
-set MDX_EXCELWRITERTYPE=LateBound
+set ExcelWriterType=LateBound
 ```
 
 ### Usage Benefits
@@ -79,15 +79,42 @@ The LateBound writer provides several advantages:
 - **No Assembly Dependencies**: Uses late-bound COM to avoid version-specific references
 - **Reliable Live Integration**: Similar to xlwings functionality for Python
 
+### Error Handling & Resilience
+
+The Excel writer includes robust error handling for COM-related failures:
+
+- **Exponential Backoff**: When Excel write operations fail (e.g., COM exception 0x800A01A8), the writer implements exponential backoff without retries
+- **Graceful Degradation**: Market data continues flowing even when Excel writes fail - no data loss in the pipeline
+- **Smart Logging**: Error verbosity decreases over time (detailed logs for first few failures, then reduced frequency to avoid log spam)
+- **Automatic Recovery**: When Excel becomes available again, normal operations resume immediately
+- **Backoff Duration**: Starts at 500ms, doubles with each consecutive failure, capped at 30 seconds maximum delay
+- **Non-Blocking**: Failed Excel writes don't block or slow down market data ingestion
+
 ## Configuration
 
-Configuration is loaded in layers:
+The application uses .NET's standard configuration system with the following priority order (highest to lowest):
 
-1. Internal defaults (see `AppConfiguration`)
-2. Optional JSON file `appsettings.json` (or explicit path passed to loader)
-3. Environment variable overrides prefixed with `MDX_`
+1. Command-line arguments (if provided)
+2. Environment variables
+3. `appsettings.json` file (if present)
+4. Built-in defaults (see `AppConfiguration`)
 
-If validation fails a `ConfigurationException` is thrown with aggregated error messages.
+Configuration is strongly-typed and validated on startup. If validation fails, a `ConfigurationException` is thrown with aggregated error messages.
+
+### Command-Line Arguments
+
+You can override any configuration setting using command-line arguments with the following formats:
+
+```bash
+# Using = syntax
+dotnet run --ExcelFilePath="MyData.xlsx" --StaleSeconds=10
+
+# Using space syntax  
+dotnet run --ExcelFilePath "MyData.xlsx" --StaleSeconds 10
+
+# Using / syntax (Windows)
+dotnet run /ExcelFilePath:"MyData.xlsx" /StaleSeconds:10
+```
 
 ### Sample `appsettings.sample.json`
 
@@ -113,31 +140,32 @@ Rename to `appsettings.json` to activate.
 
 ### Environment Variable Overrides
 
-| Env Var | Maps To | Notes |
-|--------|---------|-------|
-| MDX_EXCELFILEPATH | ExcelFilePath | Must end with `.xlsx` |
-| MDX_WORKSHEETNAME | WorksheetName | Primary market data sheet |
-| MDX_EXCELWRITERTYPE | ExcelWriterType | LateBound (default) |
-| MDX_STALESECONDS | StaleSeconds | 1–300 |
-| MDX_BATCH_HIGHWATERMARK | BatchHighWatermark | 1–10000 |
-| MDX_BATCH_MAXAGEMS | BatchMaxAgeMs | < StaleSeconds*1000 |
-| MDX_SYMBOLSCANINTERVALSECONDS | SymbolScanIntervalSeconds | For future scanning extensions |
-| MDX_MAXTICKSPERSYMBOL | MaxTicksPerSymbol | Retention threshold |
-| MDX_TICKRETENTIONMINUTES | TickRetentionMinutes | Retention window |
-| MDX_PRIORITY_SYMBOLS | PrioritySymbols | Comma-separated list |
-| MDX_ENABLEREPLAYLOGGING | EnableReplayLogging | true/false |
-| MDX_REPLAYLOGPATH | ReplayLogPath | Optional file path |
-| MDX_DISABLE_DEMO | (no config field) | When `1`, disables synthetic feed |
-| MDX_LOGLEVEL | LogLevel | One of Trace, Debug, Information, Warning, Error, Critical, None |
-| MDX_FEEDMODE | FeedMode | Demo (default) or Real |
-| MDX_REALFEED_ENDPOINT | RealFeedEndpoint | Required when FeedMode=Real and generic provider |
-| MDX_REALFEED_APIKEY | RealFeedApiKey | Required when generic Real provider used |
-| MDX_REALFEED_PROVIDER | RealFeedProvider | None (default) or Primary |
-| MDX_PRIMARY_USERNAME | PrimaryUsername | Required when provider=Primary |
-| MDX_PRIMARY_PASSWORD | PrimaryPassword | Required when provider=Primary |
-| MDX_PRIMARY_ENVIRONMENT | PrimaryEnvironment | e.g. Demo / Prod (case-insensitive) |
-| MDX_PRIMARY_ACCOUNT | PrimaryAccount | Optional (reserved for future order/trade features) |
-| MDX_PRIMARY_DUMP | (diagnostic) | When `1`, logs discovered Primary.* assemblies |
+The application uses .NET's standard configuration providers, which support environment variable overrides using standard naming conventions. Environment variable names should match the configuration property names directly, or use double underscores (`__`) for nested properties.
+
+| Environment Variable | Maps To Configuration | Notes |
+|---------------------|----------------------|-------|
+| ExcelFilePath | ExcelFilePath | Must end with `.xlsx` |
+| WorksheetName | WorksheetName | Primary market data sheet |
+| ExcelWriterType | ExcelWriterType | LateBound (default) |
+| StaleSeconds | StaleSeconds | 1–300 |
+| BatchHighWatermark | BatchHighWatermark | 1–10000 |
+| BatchMaxAgeMs | BatchMaxAgeMs | < StaleSeconds*1000 |
+| SymbolScanIntervalSeconds | SymbolScanIntervalSeconds | For future scanning extensions |
+| MaxTicksPerSymbol | MaxTicksPerSymbol | Retention threshold |
+| TickRetentionMinutes | TickRetentionMinutes | Retention window |
+| PrioritySymbols | PrioritySymbols | Comma-separated list |
+| EnableReplayLogging | EnableReplayLogging | true/false |
+| ReplayLogPath | ReplayLogPath | Optional file path |
+| LogLevel | LogLevel | One of Trace, Debug, Information, Warning, Error, Critical, None |
+| FeedMode | FeedMode | Demo (default) or Real |
+| RealFeedEndpoint | RealFeedEndpoint | Required when FeedMode=Real and generic provider |
+| RealFeedApiKey | RealFeedApiKey | Required when generic Real provider used |
+| RealFeedProvider | RealFeedProvider | None (default) or Primary |
+| PrimaryUsername | PrimaryUsername | Required when provider=Primary |
+| PrimaryPassword | PrimaryPassword | Required when provider=Primary |
+| PrimaryEnvironment | PrimaryEnvironment | e.g. Test / Prod (case-insensitive) |
+| PrimaryAccount | PrimaryAccount | Optional (reserved for future order/trade features) |
+| Logging__LogLevel__MarketDataExcelUpdater | (logging override) | Debug level for MarketDataExcelUpdater namespace |
 
 ### Retention Behavior
 
@@ -191,15 +219,15 @@ Because this is reflection-based:
 
 #### Enabling the Primary Feed
 
-Set required environment variables (Windows `cmd.exe` example):
+Set required environment variables (Windows PowerShell example):
 
 ```pwsh
-$env:MDX_FEED_MODE = "Real"
-$env:MDX_REAL_FEED_PROVIDER = "Primary"
-$env:MDX_PRIMARY_USERNAME = "22321456"  # Your username from the logs
-$env:MDX_PRIMARY_PASSWORD = "YOUR_ACTUAL_PASSWORD"  # Replace with real password
-$env:MDX_PRIMARY_ENVIRONMENT = "Prod"
-$env:MDX_SYMBOLS = "MERV - XMEV - GGAL - 24hs,MERV - XMEV - PAMP - 24hs,MERV - XMEV - YPFD - 24hs"  # Test with these symbols
+$env:FeedMode = "Real"
+$env:RealFeedProvider = "Primary"
+$env:PrimaryUsername = "22321456"  # Your username from the logs
+$env:PrimaryPassword = "YOUR_ACTUAL_PASSWORD"  # Replace with real password
+$env:PrimaryEnvironment = "Prod"
+$env:PrioritySymbols = "MERV - XMEV - GGAL - 24hs,MERV - XMEV - PAMP - 24hs,MERV - XMEV - YPFD - 24hs"  # Test with these symbols
 $env:Logging__LogLevel__MarketDataExcelUpdater = "Debug"
 ```
 
@@ -211,17 +239,13 @@ dotnet run --project src\MarketDataExcelUpdater
 
 If credentials are valid and symbols resolve, bid/ask updates will flow into `MarketData.xlsx`.
 
-To inspect library metadata:
-
-```pwsh
-$env:MDX_PRIMARY_ENVIRONMENT = 1
-```
+To inspect library metadata, create a diagnostic environment variable that the Primary provider can check (implementation detail).
 
 Run again and review log lines for loaded assemblies.
 
 ### Demo Feed
 
-Enabled by default. Generates pseudo-random quotes for configured `PrioritySymbols` (or fallback list). Disable via `MDX_DISABLE_DEMO=1`. Each symbol maintains an increasing sequence number.
+Enabled by default when `FeedMode=Demo` (default setting). Generates pseudo-random quotes for configured `PrioritySymbols` (or fallback list). Each symbol maintains an increasing sequence number.
 
 ### Graceful Shutdown
 
@@ -264,14 +288,17 @@ Enabled by default. Generates pseudo-random quotes for configured `PrioritySymbo
 | Symptom | Possible Cause | Resolution |
 |---------|----------------|-----------|
 | Workbook not created | No write permission | Run from writable directory / adjust path |
-| No data appearing | Demo disabled + Real not configured | Set `MDX_FEEDMODE=Demo` or provide real env vars |
-| Validation exception | Bad JSON or env values | Fix errors listed in exception message |
-| High flush frequency | Low `BatchHighWatermark` | Increase env var or JSON setting |
-| Primary login failing | Wrong credentials or environment | Verify `MDX_PRIMARY_*` vars and environment name |
-| Missing symbols | Symbol not in provider universe | Adjust `MDX_PRIORITY_SYMBOLS` / verify listing |
-| No Primary quotes but connected | API shape change | Enable `MDX_PRIMARY_DUMP=1` & check logs; update adapter mapping |
+| No data appearing | Real feed not configured | Set `FeedMode=Demo` or configure real feed environment variables |
+| Configuration exception | Invalid JSON or environment values | Fix errors listed in exception message |
+| High flush frequency | Low `BatchHighWatermark` | Increase environment variable or JSON setting |
+| Primary login failing | Wrong credentials or environment | Verify `PrimaryUsername`, `PrimaryPassword`, `PrimaryEnvironment` |
+| Missing symbols | Symbol not in provider universe | Adjust `PrioritySymbols` / verify listing |
+| No Primary quotes but connected | API shape change | Check logs and update adapter mapping if needed |
 | "Could not load Excel application" | Excel not installed or COM issue | Install Microsoft Excel and ensure proper COM registration |
 | LateBound writer fails | Excel COM registration issue | Try running Excel as administrator once or reinstalling Office |
+| Repeated Excel write failures | Excel busy/locked, COM issues | Application will use exponential backoff (up to 30s), market data continues flowing |
+| COM Exception 0x800A01A8 | Excel worksheet/cell access issue | Temporary issue - exponential backoff will retry when Excel is available |
+| Excel writes stop but data flows | Excel in backoff period | Normal behavior - Excel writes resume automatically when backoff period expires |
 
 ### License
 

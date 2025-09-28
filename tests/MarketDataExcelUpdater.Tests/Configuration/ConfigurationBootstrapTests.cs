@@ -27,7 +27,7 @@ public class ConfigurationBootstrapTests
     {
         var logger = new Mock<ILogger>();
         // Force invalid config via env var
-        Environment.SetEnvironmentVariable("MDX_EXCELFILEPATH", "bad.txt");
+        Environment.SetEnvironmentVariable("ExcelFilePath", "bad.txt");
         try
         {
             Action act = () => ConfigurationBootstrap.LoadWithLogging(logger.Object);
@@ -35,7 +35,7 @@ public class ConfigurationBootstrapTests
         }
         finally
         {
-            Environment.SetEnvironmentVariable("MDX_EXCELFILEPATH", null);
+            Environment.SetEnvironmentVariable("ExcelFilePath", null);
         }
     }
 }

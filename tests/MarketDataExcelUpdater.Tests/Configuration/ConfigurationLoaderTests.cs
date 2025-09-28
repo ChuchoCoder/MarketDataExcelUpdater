@@ -29,8 +29,8 @@ public class ConfigurationLoaderTests
             // Minimal JSON
             File.WriteAllText(fileName, "{ \"ExcelFilePath\": \"MarketData.xlsx\" }");
 
-            Environment.SetEnvironmentVariable("MDX_STALESECONDS", "12");
-            Environment.SetEnvironmentVariable("MDX_BATCH_HIGHWATERMARK", "250");
+            Environment.SetEnvironmentVariable("StaleSeconds", "12");
+            Environment.SetEnvironmentVariable("BatchHighWatermark", "250");
 
             var cfg = ConfigurationLoader.Load(jsonPath: fileName, optional: true);
             cfg.StaleSeconds.Should().Be(12);
@@ -38,8 +38,8 @@ public class ConfigurationLoaderTests
         }
         finally
         {
-            Environment.SetEnvironmentVariable("MDX_STALESECONDS", null);
-            Environment.SetEnvironmentVariable("MDX_BATCH_HIGHWATERMARK", null);
+            Environment.SetEnvironmentVariable("StaleSeconds", null);
+            Environment.SetEnvironmentVariable("BatchHighWatermark", null);
             if (File.Exists(fileName)) File.Delete(fileName);
         }
     }
@@ -70,33 +70,33 @@ public class ConfigurationLoaderTests
         try
         {
             File.WriteAllText(fileName, "{ \"ExcelFilePath\": \"MarketData.xlsx\" }");
-            Environment.SetEnvironmentVariable("MDX_LOGLEVEL", "Debug");
+            Environment.SetEnvironmentVariable("LogLevel", "Debug");
             var cfg = ConfigurationLoader.Load(jsonPath: fileName, optional: true);
             ((int)cfg.LogLevel).Should().Be((int)Microsoft.Extensions.Logging.LogLevel.Debug);
         }
         finally
         {
-            Environment.SetEnvironmentVariable("MDX_LOGLEVEL", null);
+            Environment.SetEnvironmentVariable("LogLevel", null);
             if (File.Exists(fileName)) File.Delete(fileName);
         }
     }
 
     [Fact]
-    public void Invalid_log_level_env_causes_validation_error()
+    public void Invalid_log_level_env_causes_configuration_error()
     {
         const string fileName = "temp-appsettings.json";
         try
         {
             File.WriteAllText(fileName, "{ \"ExcelFilePath\": \"MarketData.xlsx\" }");
-            Environment.SetEnvironmentVariable("MDX_LOGLEVEL", "NotARealLevel");
-            // Parsing will throw ArgumentException inside ConvertValue => TryApply returns false => LogLevel remains default => no validation error.
-            // So instead we assert it silently ignored bad value and stayed Information.
-            var cfg = ConfigurationLoader.Load(jsonPath: fileName, optional: true);
-            cfg.LogLevel.Should().Be(Microsoft.Extensions.Logging.LogLevel.Information);
+            Environment.SetEnvironmentVariable("LogLevel", "NotARealLevel");
+            // With .NET's configuration binder, invalid enum values will cause binding to throw a configuration exception
+            Action act = () => ConfigurationLoader.Load(jsonPath: fileName, optional: true);
+            act.Should().Throw<ConfigurationException>()
+               .Which.Errors.Should().Contain(e => e.Contains("Failed to convert configuration value", StringComparison.OrdinalIgnoreCase));
         }
         finally
         {
-            Environment.SetEnvironmentVariable("MDX_LOGLEVEL", null);
+            Environment.SetEnvironmentVariable("LogLevel", null);
             if (File.Exists(fileName)) File.Delete(fileName);
         }
     }

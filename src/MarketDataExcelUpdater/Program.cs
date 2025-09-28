@@ -27,7 +27,7 @@ AppConfiguration config;
 try
 {
 	// 1. Load configuration (bootstrap logger for diagnostics)
-	config = ConfigurationBootstrap.LoadWithLogging(bootstrapLoggerFactory.CreateLogger("Config"));
+	config = ConfigurationBootstrap.LoadWithLogging(bootstrapLoggerFactory.CreateLogger("Config"), args: args);
 
 	// 1b. Rebuild logger factory with configured minimum level and namespace-specific overrides
 	var configuredLoggerFactory = LoggerFactory.Create(builder =>
