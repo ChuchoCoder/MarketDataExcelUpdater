@@ -12,7 +12,7 @@ Templates requiring updates:
 Follow-up TODOs: none (no unresolved placeholders)
 -->
 
-# pyRofex-to-Excel Constitution
+# MarketDataExcelUpdater Constitution
 
 ## Core Principles
 
